@@ -1,0 +1,8 @@
+fastapi==0.104.1
+uvicorn[standard]==0.24.0.post1
+onnxruntime-gpu==1.19.2
+fast-plate-ocr==1.0.0
+open-image-models==0.4.0
+opencv-python-headless==4.11.0.86
+numpy==1.26.4
+python-multipart==0.0.17
