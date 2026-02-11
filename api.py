@@ -4,7 +4,10 @@ FastAPI wrapper around the FastALPR pipeline.
 POST /detect accepts an image file (multipart/form-data) and returns detections plus OCR text.
 """
 
+import base64
+import json
 import logging
+import os
 import time
 from collections.abc import Sequence
 from io import BytesIO
@@ -19,6 +22,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from fast_alpr import ALPR, ALPRResult
+from filemaker_client import FileMakerClient, FileMakerError
 
 
 class BoundingBoxModel(BaseModel):
@@ -49,8 +53,42 @@ class DetectResponse(BaseModel):
     results: list[ALPRItem]
 
 
+class FileMakerCallResult(BaseModel):
+    plate_text: str
+    frame_number: int
+    success: bool
+    error_message: str | None = None
+    fm_response: dict | None = None
+
+
+class ScanPlateRecord(BaseModel):
+    plate_text: str
+    confidence: float
+    bounding_box: BoundingBoxModel
+    frame_number: int
+    fm_call: FileMakerCallResult
+
+
+class VideoScanResponse(BaseModel):
+    total_frames: int
+    processing_time_seconds: float
+    plates_detected: int
+    fm_calls_made: int
+    fm_calls_succeeded: int
+    fm_calls_failed: int
+    detections: list[ScanPlateRecord]
+
+
 app = FastAPI(title="FastALPR API", version="0.1.0")
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    force=True,
+)
+for _logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+    logging.getLogger(_logger_name).setLevel(logging.INFO)
+for _logger_name in ("httpx", "httpcore"):
+    logging.getLogger(_logger_name).setLevel(logging.WARNING)
 logger = logging.getLogger("fast_alpr.api")
 
 
@@ -125,6 +163,38 @@ def _get_alpr() -> ALPR:
         )
         _log_providers(app.state.alpr)
     return app.state.alpr
+
+
+def _get_fm_client() -> FileMakerClient:
+    """
+    Lazily initialize the FileMaker client once and reuse across requests.
+    """
+    if not hasattr(app.state, "fm_client"):
+        required_vars = ["FM_HOST", "FM_DATABASE", "FM_USERNAME", "FM_PASSWORD",
+                         "FM_LAYOUT", "FM_SCRIPT"]
+        missing = [v for v in required_vars if not os.environ.get(v)]
+        if missing:
+            raise RuntimeError(
+                f"Missing required FileMaker environment variables: {', '.join(missing)}"
+            )
+
+        verify_ssl = os.environ.get("FM_VERIFY_SSL", "true").lower() in ("true", "1", "yes")
+
+        app.state.fm_client = FileMakerClient(
+            host=os.environ["FM_HOST"],
+            database=os.environ["FM_DATABASE"],
+            username=os.environ["FM_USERNAME"],
+            password=os.environ["FM_PASSWORD"],
+            layout=os.environ["FM_LAYOUT"],
+            script=os.environ["FM_SCRIPT"],
+            verify_ssl=verify_ssl,
+        )
+        logger.info(
+            "FileMaker client initialized (host=%s, database=%s)",
+            os.environ["FM_HOST"],
+            os.environ["FM_DATABASE"],
+        )
+    return app.state.fm_client
 
 
 def _log_providers(alpr: ALPR) -> None:
@@ -314,3 +384,214 @@ async def detect_video(file: UploadFile = File(...)) -> StreamingResponse:
         media_type="video/mp4",
         headers={"Content-Disposition": 'inline; filename="annotated.mp4"'},
     )
+
+
+@app.post("/detect/video/scan", response_model=VideoScanResponse)
+async def detect_video_scan(file: UploadFile = File(...)) -> VideoScanResponse:
+    """
+    Scan an uploaded video for license plates and notify FileMaker for each detection.
+
+    A 5-second cooldown per plate text prevents duplicate notifications.
+    Returns a JSON summary of all detections and FileMaker call results.
+    """
+    start = time.perf_counter()
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    logger.info(
+        "Video scan request received (filename=%s, size_bytes=%d)",
+        file.filename,
+        len(contents),
+    )
+
+    input_suffix = Path(file.filename or "").suffix or ".mp4"
+
+    logger.info("Initializing ALPR and FileMaker clients for video scan")
+    alpr = _get_alpr()
+    try:
+        fm_client = _get_fm_client()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    temp_in = NamedTemporaryFile(delete=False, suffix=input_suffix)
+    frames_processed = 0
+    detections: list[ScanPlateRecord] = []
+
+    # Throttle state: plate_text -> last trigger time (monotonic)
+    plate_cooldowns: dict[str, float] = {}
+    cooldown_seconds = 5.0
+
+    try:
+        temp_in.write(contents)
+        temp_in.flush()
+        cap = cv2.VideoCapture(temp_in.name)
+        if not cap.isOpened():
+            raise HTTPException(status_code=400, detail="Unable to read uploaded video.")
+        logger.info("Video opened successfully for scanning (temp_file=%s)", temp_in.name)
+
+        while True:
+            success, frame = cap.read()
+            if not success:
+                break
+            if frame is None:
+                continue
+
+            frames_processed += 1
+            if frames_processed % 30 == 0:
+                logger.info(
+                    "Video scan progress: processed %d frames, detections recorded=%d",
+                    frames_processed,
+                    len(detections),
+                )
+            results = alpr.predict(frame)
+            if results:
+                logger.info(
+                    "Frame %d: ALPR produced %d candidate(s)",
+                    frames_processed,
+                    len(results),
+                )
+
+            for result in results:
+                if result.ocr is None or not result.ocr.text:
+                    logger.info("Frame %d: skipped candidate without OCR text", frames_processed)
+                    continue
+
+                plate_text = result.ocr.text
+                now = time.monotonic()
+
+                # Skip if same plate was triggered within cooldown
+                last_trigger = plate_cooldowns.get(plate_text)
+                if last_trigger is not None and (now - last_trigger) < cooldown_seconds:
+                    logger.info(
+                        "Frame %d: skipped plate '%s' due to cooldown (%.2fs remaining)",
+                        frames_processed,
+                        plate_text,
+                        cooldown_seconds - (now - last_trigger),
+                    )
+                    continue
+
+                plate_cooldowns[plate_text] = now
+                logger.info(
+                    "Frame %d: accepted plate '%s' for FileMaker call",
+                    frames_processed,
+                    plate_text,
+                )
+
+                # Crop the plate image for base64 encoding
+                bbox = result.detection.bounding_box
+                h, w = frame.shape[:2]
+                x1 = max(bbox.x1, 0)
+                y1 = max(bbox.y1, 0)
+                x2 = min(bbox.x2, w)
+                y2 = min(bbox.y2, h)
+                cropped = frame[y1:y2, x1:x2]
+
+                ok, buf = cv2.imencode(".jpg", cropped)
+                plate_b64 = base64.b64encode(buf.tobytes()).decode() if ok else ""
+
+                # Compute scalar confidence
+                conf = result.ocr.confidence
+                scalar_conf = float(
+                    conf if isinstance(conf, float) else sum(conf) / len(conf)
+                )
+
+                # Build the script parameter as a single JSON string
+                script_param = json.dumps({
+                    "plate_text": plate_text,
+                    "confidence": scalar_conf,
+                    "bounding_box": {
+                        "x1": int(bbox.x1),
+                        "y1": int(bbox.y1),
+                        "x2": int(bbox.x2),
+                        "y2": int(bbox.y2),
+                    },
+                    "frame_number": frames_processed,
+                    "plate_image_base64": plate_b64,
+                })
+                # Call FileMaker — continue processing on failure
+                try:
+                    fm_response = await fm_client.execute_script(script_param)
+                    fm_call = FileMakerCallResult(
+                        plate_text=plate_text,
+                        frame_number=frames_processed,
+                        success=True,
+                        fm_response=fm_response,
+                    )
+                    logger.info(
+                        "FM script call succeeded for plate '%s' at frame %d",
+                        plate_text,
+                        frames_processed,
+                    )
+                except FileMakerError as exc:
+                    fm_call = FileMakerCallResult(
+                        plate_text=plate_text,
+                        frame_number=frames_processed,
+                        success=False,
+                        error_message=str(exc),
+                    )
+                    logger.warning(
+                        "FM script call failed for plate '%s' at frame %d: %s",
+                        plate_text,
+                        frames_processed,
+                        exc,
+                    )
+
+                detections.append(ScanPlateRecord(
+                    plate_text=plate_text,
+                    confidence=scalar_conf,
+                    bounding_box=BoundingBoxModel(
+                        x1=int(bbox.x1),
+                        y1=int(bbox.y1),
+                        x2=int(bbox.x2),
+                        y2=int(bbox.y2),
+                    ),
+                    frame_number=frames_processed,
+                    fm_call=fm_call,
+                ))
+
+        cap.release()
+
+    except HTTPException:
+        raise
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.exception("Unexpected error during /detect/video/scan")
+        raise HTTPException(
+            status_code=500, detail="Failed to process video for scanning."
+        ) from exc
+    finally:
+        try:
+            temp_in.close()
+        finally:
+            Path(temp_in.name).unlink(missing_ok=True)
+
+    elapsed = time.perf_counter() - start
+    fm_succeeded = sum(1 for d in detections if d.fm_call.success)
+    fm_failed = sum(1 for d in detections if not d.fm_call.success)
+
+    logger.info(
+        "Video scan: %d frames, %d plates, %d FM calls (%d ok, %d failed) in %.3fs",
+        frames_processed,
+        len(detections),
+        len(detections),
+        fm_succeeded,
+        fm_failed,
+        elapsed,
+    )
+
+    return VideoScanResponse(
+        total_frames=frames_processed,
+        processing_time_seconds=round(elapsed, 3),
+        plates_detected=len(detections),
+        fm_calls_made=len(detections),
+        fm_calls_succeeded=fm_succeeded,
+        fm_calls_failed=fm_failed,
+        detections=detections,
+    )
+
+
+@app.on_event("shutdown")
+async def shutdown_event() -> None:
+    """Clean up FileMaker session on application shutdown."""
+    if hasattr(app.state, "fm_client"):
+        await app.state.fm_client.close()
+        logger.info("FileMaker client closed on shutdown")

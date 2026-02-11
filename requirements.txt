@@ -6,3 +6,4 @@ open-image-models==0.4.0
 opencv-python-headless==4.11.0.86
 numpy==1.26.4
 python-multipart==0.0.17
+httpx==0.27.2
